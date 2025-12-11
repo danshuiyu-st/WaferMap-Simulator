@@ -191,16 +191,30 @@
             writeUnits() { 
                 const buffer = new ArrayBuffer(20); const view = new DataView(buffer);
                 view.setUint16(0, 20); view.setUint8(2, 0x03); view.setUint8(3, 0x05); 
+                // DB unit is usually 1nm. User unit 1mm = 0.001. 
                 const u1 = [0x3E, 0x41, 0x89, 0x37, 0x4B, 0xC6, 0xA7, 0xEF]; const u2 = [0x39, 0x44, 0xB8, 0x2F, 0xA0, 0x9B, 0x5A, 0x52];
                 for(let i=0; i<8; i++) view.setUint8(4+i, u1[i]); for(let i=0; i<8; i++) view.setUint8(12+i, u2[i]);
                 this.buffer.push(buffer);
             }
-            writeBgnStr(name) { const now = new Date(); const t = [now.getFullYear(), now.getMonth()+1, now.getDate(), now.getHours(), now.getMinutes(), now.getSeconds()]; this.addRecord(0x05, 0x02, [...t, ...t]); this.addRecord(0x06, 0x06, name); }
+            writeBgnStr(name) { 
+                const now = new Date(); const t = [now.getFullYear(), now.getMonth()+1, now.getDate(), now.getHours(), now.getMinutes(), now.getSeconds()]; 
+                this.addRecord(0x05, 0x02, [...t, ...t]); 
+                // Filter invalid characters for structure name (only A-Z, 0-9, _, ?, $)
+                const safeName = name.replace(/[^a-zA-Z0-9_\?\$\.]/g, '_').substring(0, 32); 
+                this.addRecord(0x06, 0x06, safeName); 
+            }
             writePath(layer, dataType, width, xy) {
                 this.addRecord(0x09, 0x00); this.addRecord(0x0D, 0x02, [layer]); this.addRecord(0x0E, 0x02, [dataType]); 
                 this.addRecord(0x21, 0x02, [0]); this.addRecord(0x0F, 0x03, [width]); this.addRecord(0x10, 0x03, xy); this.addRecord(0x11, 0x00); 
             }
             writeBoundary(layer, dataType, xy) { this.addRecord(0x08, 0x00); this.addRecord(0x0D, 0x02, [layer]); this.addRecord(0x0E, 0x02, [dataType]); this.addRecord(0x10, 0x03, xy); this.addRecord(0x11, 0x00); }
+            writeSref(name, xy) {
+                this.addRecord(0x0A, 0x00); // SREF
+                const safeName = name.replace(/[^a-zA-Z0-9_\?\$\.]/g, '_').substring(0, 32);
+                this.addRecord(0x12, 0x06, safeName); // SNAME
+                this.addRecord(0x10, 0x03, xy); // XY (one point)
+                this.addRecord(0x11, 0x00); // ENDEL
+            }
             writeEndStr() { this.addRecord(0x07, 0x00); }
             writeEndLib() { this.addRecord(0x04, 0x00); }
             getBlob() { return new Blob(this.buffer, { type: 'application/octet-stream' }); }
@@ -1061,26 +1075,89 @@
             const handleExportGDS = () => {
                 if (stats.isHighDensity || stats.isTooHeavy) { alert("GDS Export is disabled in High Density Mode."); return; }
                 const { dies, shots, waferR, validR, waferPoly, validPoly } = calculatedDataRef.current; 
-                const writer = new GDSWriter(); const unitScale = 1000000; 
-                writer.writeHeader(); writer.writeBgnLib(); writer.writeLibName("WAFER_MAP_LIB"); writer.writeUnits(); writer.writeBgnStr("WAFER_TOP");
-                const toGdsPoints = (poly) => { const pts = []; poly.forEach(p => pts.push(Math.round(p.x * unitScale), Math.round(p.y * unitScale))); return pts; };
-                if (waferPoly && waferPoly.length > 0) writer.writeBoundary(gdsLayers.wafer, 0, toGdsPoints(waferPoly));
+                const writer = new GDSWriter(); 
                 
+                // Determine scale based on unit. GDS internal usually nm (or just DB unit).
+                // Existing header writes 1e-3 user unit (mm) and 1e-9 db unit (nm).
+                // If input is mm, scale by 1,000,000 to get nm.
+                // If input is um, scale by 1,000 to get nm.
+                const unitScale = unit === 'mm' ? 1000000 : 1000;
+                
+                writer.writeHeader(); writer.writeBgnLib(); writer.writeLibName("WAFER_MAP_LIB"); writer.writeUnits(); 
+                
+                const toGdsPts = (poly) => poly.map(p => Math.round(p.x * unitScale)).flatMap((v, i, arr) => i % 2 === 0 ? [v, Math.round(arr[i+1]*unitScale)] : []).filter((_, i) => i % 2 === 0).flatMap((x, i, arr) => [x, poly[i].y * unitScale]).map(Math.round);
+                // Correct point mapper simpler:
+                const mapPts = (poly) => poly.flatMap(p => [Math.round(p.x * unitScale), Math.round(p.y * unitScale)]);
+
+                // 1. DEFINE CELL STRUCTURES
+                // Create unique definitions for each die type
+                const definitions = mode === 'single' 
+                    ? [{ id: 0, label: 'Single', width: parseNum(singleParams.width), height: parseNum(singleParams.height) }]
+                    : dieDefinitions.map(d => ({ id: d.id, label: d.label, width: parseNum(d.width), height: parseNum(d.height) }));
+
+                const createdCells = new Set();
+
+                definitions.forEach(def => {
+                    ['good', 'edge', 'defect'].forEach(status => {
+                        const cellName = `DIE_${def.id}_${status.toUpperCase()}`;
+                        writer.writeBgnStr(cellName);
+                        
+                        let layer = gdsLayers.good;
+                        if (status === 'edge') layer = gdsLayers.edge;
+                        if (status === 'defect') layer = gdsLayers.defect;
+
+                        const hw = def.width / 2;
+                        const hh = def.height / 2;
+                        const box = [-hw, -hh, hw, -hh, hw, hh, -hw, hh, -hw, -hh].map(v => Math.round(v * unitScale));
+                        
+                        writer.writeBoundary(layer, def.id, box);
+                        writer.writeEndStr();
+                        createdCells.add(cellName);
+                    });
+                });
+
+                // Optional Shot Border Cell
+                let shotCellName = null;
+                if (mode === 'shot' && shots.length > 0) {
+                    shotCellName = "SHOT_BORDER";
+                    writer.writeBgnStr(shotCellName);
+                    const sw = parseNum(shotParams.width);
+                    const sh = parseNum(shotParams.height);
+                    const hw = sw/2; const hh = sh/2;
+                    const box = [-hw, -hh, hw, -hh, hw, hh, -hw, hh, -hw, -hh].map(v => Math.round(v * unitScale));
+                    writer.writeBoundary(gdsLayers.shot, 0, box);
+                    writer.writeEndStr();
+                }
+
+                // 2. TOP LEVEL CELL
+                writer.writeBgnStr("WAFER_TOP");
+
+                // Wafer Boundary
+                if (waferPoly && waferPoly.length > 0) writer.writeBoundary(gdsLayers.wafer, 0, mapPts(waferPoly));
+                
+                // Center Cross
                 const cSize = waferR + (2 * waferR * 0.1); const cW = 0.1; 
                 writer.writePath(gdsLayers.center, 0, Math.round(cW*unitScale), [Math.round(-cSize*unitScale), 0, Math.round(cSize*unitScale), 0]);
                 writer.writePath(gdsLayers.center, 0, Math.round(cW*unitScale), [0, Math.round(-cSize*unitScale), 0, Math.round(cSize*unitScale), 0]);
 
-                if (mode === 'shot') { shots.forEach(s => { const x1 = Math.round((s.x - s.w/2) * unitScale); const y1 = Math.round((s.y - s.h/2) * unitScale); const x2 = Math.round((s.x + s.w/2) * unitScale); const y2 = Math.round((s.y + s.h/2) * unitScale); writer.writeBoundary(gdsLayers.shot, 0, [x1, y1, x2, y1, x2, y2, x1, y2, x1, y1]); }); }
-                dies.forEach(d => { 
-                    let layer;
-                    if (d.status === 'good') layer = gdsLayers.good;
-                    else if (d.status === 'defect') layer = gdsLayers.defect;
-                    else layer = gdsLayers.edge;
-                    
-                    const x1 = Math.round((d.x - d.w/2) * unitScale); const y1 = Math.round((d.y - d.h/2) * unitScale); const x2 = Math.round((d.x + d.w/2) * unitScale); const y2 = Math.round((d.y + d.h/2) * unitScale); 
-                    writer.writeBoundary(layer, d.typeId, [x1, y1, x2, y1, x2, y2, x1, y2, x1, y1]); 
+                // Place Shots (Instances)
+                if (mode === 'shot' && shotCellName) {
+                    shots.forEach(s => {
+                        writer.writeSref(shotCellName, [Math.round(s.x * unitScale), Math.round(s.y * unitScale)]);
+                    });
+                }
+
+                // Place Dies (Instances)
+                dies.forEach(d => {
+                    const cellName = `DIE_${d.typeId}_${d.status.toUpperCase()}`;
+                    if (createdCells.has(cellName)) {
+                        writer.writeSref(cellName, [Math.round(d.x * unitScale), Math.round(d.y * unitScale)]);
+                    }
                 });
-                writer.writeEndStr(); writer.writeEndLib();
+
+                writer.writeEndStr();
+                writer.writeEndLib();
+                
                 const blob = writer.getBlob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `wafer_map_${waferParams.diameter}mm.gds`; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
             };
 
